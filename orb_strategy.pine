@@ -1,0 +1,249 @@
+// This Pine Script™ is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=5
+strategy("ORB Futures Trading Bot", overlay=true, default_qty_type=strategy.contracts, default_qty_value=1, calc_on_every_tick=false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── ORB Timing ──────────────────────────────────────────────────────────────
+i_orb_hour       = input.int(9, "ORB Candle Hour (EST)", minval=0, maxval=23, group="ORB Timing")
+i_orb_minute     = input.int(35, "ORB Candle Minute", minval=0, maxval=59, group="ORB Timing")
+i_trade_end_hour = input.int(15, "Last Entry Hour (EST)", minval=0, maxval=23, group="ORB Timing")
+i_trade_end_min  = input.int(45, "Last Entry Minute", minval=0, maxval=59, group="ORB Timing")
+i_close_eod_hour = input.int(15, "Force Close Hour (EST)", minval=0, maxval=23, group="ORB Timing")
+i_close_eod_min  = input.int(55, "Force Close Minute", minval=0, maxval=59, group="ORB Timing")
+
+// ── Breakout Confirmation ───────────────────────────────────────────────────
+i_body_ratio     = input.float(0.50, "Min Body Ratio (strong candle)", minval=0.1, maxval=1.0, step=0.05, group="Breakout")
+
+// ── VWAP Filter ─────────────────────────────────────────────────────────────
+i_use_vwap       = input.bool(true, "Require VWAP Directional Bias", group="VWAP")
+
+// ── ATR Filter ──────────────────────────────────────────────────────────────
+i_use_atr        = input.bool(true, "Enable ATR Range Filter", group="ATR Filter")
+i_atr_period     = input.int(14, "ATR Period (Daily)", minval=1, group="ATR Filter")
+i_atr_min_mult   = input.float(0.5, "ATR Min Multiplier", minval=0.1, step=0.1, group="ATR Filter")
+i_atr_max_mult   = input.float(2.0, "ATR Max Multiplier", minval=0.5, step=0.1, group="ATR Filter")
+
+// ── Premarket Filter ────────────────────────────────────────────────────────
+i_use_premarket  = input.bool(true, "Enable Premarket Volume Filter", group="Premarket")
+i_pm_start_hour  = input.int(4, "Premarket Start Hour (EST)", minval=0, maxval=23, group="Premarket")
+i_pm_end_hour    = input.int(9, "Premarket End Hour (EST)", minval=0, maxval=23, group="Premarket")
+i_pm_end_min     = input.int(30, "Premarket End Minute", minval=0, maxval=59, group="Premarket")
+i_pm_vol_sma     = input.int(20, "Premarket Vol SMA Lookback (days)", minval=1, group="Premarket")
+i_pm_vol_mult    = input.float(0.5, "Min Premarket Vol vs Avg (multiplier)", minval=0.1, step=0.1, group="Premarket")
+
+// ── Risk Management ────────────────────────────────────────────────────────
+i_stop_buffer    = input.float(0.50, "Stop Loss Buffer (points beyond ORB)", minval=0.0, step=0.25, group="Risk")
+i_rr_ratio       = input.float(2.0, "Risk:Reward Ratio", minval=0.5, step=0.5, group="Risk")
+i_max_trades     = input.int(2, "Max Trades Per Day", minval=1, maxval=10, group="Risk")
+
+// ── Visuals ─────────────────────────────────────────────────────────────────
+i_show_orb       = input.bool(true, "Show ORB Levels", group="Visuals")
+i_show_vwap      = input.bool(true, "Show VWAP", group="Visuals")
+i_orb_color_hi   = input.color(color.new(color.green, 30), "ORB High Color", group="Visuals")
+i_orb_color_lo   = input.color(color.new(color.red, 30), "ORB Low Color", group="Visuals")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TIME FUNCTIONS (EST)
+// ══════════════════════════════════════════════════════════════════════════════
+
+est_hour   = hour(time, "America/New_York")
+est_minute = minute(time, "America/New_York")
+est_day    = dayofmonth(time, "America/New_York")
+
+is_new_day = ta.change(est_day) != 0
+
+is_orb_candle = est_hour == i_orb_hour and est_minute == i_orb_minute
+
+is_after_orb = (est_hour > i_orb_hour) or (est_hour == i_orb_hour and est_minute > i_orb_minute)
+
+is_before_trade_end = (est_hour < i_trade_end_hour) or (est_hour == i_trade_end_hour and est_minute <= i_trade_end_min)
+
+is_trade_window = is_after_orb and is_before_trade_end
+
+is_eod_close = est_hour == i_close_eod_hour and est_minute >= i_close_eod_min
+
+is_premarket = (est_hour >= i_pm_start_hour) and ((est_hour < i_pm_end_hour) or (est_hour == i_pm_end_hour and est_minute < i_pm_end_min))
+
+is_regular_session = (est_hour >= 9 and est_minute >= 30 and est_hour < 16) or (est_hour > 9 and est_hour < 16)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ORB LEVEL TRACKING
+// ══════════════════════════════════════════════════════════════════════════════
+
+var float orb_high       = na
+var float orb_low        = na
+var bool  orb_set        = false
+var int   trades_today   = 0
+
+// Reset on new day
+if is_new_day
+    orb_high     := na
+    orb_low      := na
+    orb_set      := false
+    trades_today := 0
+
+// Capture the 9:35 candle high/low (including wicks)
+if is_orb_candle
+    orb_high := high
+    orb_low  := low
+    orb_set  := true
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VWAP CALCULATION (session-anchored)
+// ══════════════════════════════════════════════════════════════════════════════
+
+var float cum_vol    = 0.0
+var float cum_tp_vol = 0.0
+
+// Reset VWAP at session open (9:30 EST)
+is_session_start = est_hour == 9 and est_minute == 30
+if is_session_start
+    cum_vol    := 0.0
+    cum_tp_vol := 0.0
+
+if is_regular_session
+    tp          = (high + low + close) / 3.0
+    cum_vol    += volume
+    cum_tp_vol += tp * volume
+
+vwap_value = cum_vol > 0 ? cum_tp_vol / cum_vol : na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ATR (Daily timeframe via request.security)
+// ══════════════════════════════════════════════════════════════════════════════
+
+daily_atr = request.security(syminfo.tickerid, "D", ta.atr(i_atr_period), lookahead=barmerge.lookahead_on)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PREMARKET VOLUME TRACKING
+// ══════════════════════════════════════════════════════════════════════════════
+
+var float pm_volume_today = 0.0
+var float pm_volume_sum   = 0.0
+var int   pm_day_count    = 0
+var float pm_volume_avg   = 0.0
+var bool  pm_valid        = true
+
+if is_new_day
+    // Store yesterday's premarket volume into running average
+    if pm_volume_today > 0
+        pm_volume_sum += pm_volume_today
+        pm_day_count  += 1
+        pm_volume_avg := pm_day_count > 0 ? pm_volume_sum / pm_day_count : 0.0
+    pm_volume_today := 0.0
+    pm_valid        := true
+
+if is_premarket
+    pm_volume_today += volume
+
+// Validate premarket volume once ORB candle arrives
+if is_orb_candle and i_use_premarket
+    if pm_day_count >= 5 and pm_volume_avg > 0
+        pm_valid := pm_volume_today >= pm_volume_avg * i_pm_vol_mult
+    else
+        pm_valid := true  // Not enough history yet, allow trades
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BREAKOUT DETECTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Strong candle check: body must be >= i_body_ratio of total range
+candle_body  = math.abs(close - open)
+candle_range = high - low
+body_ratio   = candle_range > 0 ? candle_body / candle_range : 0.0
+is_strong    = body_ratio >= i_body_ratio
+
+// ORB range for ATR comparison
+orb_range = orb_set ? orb_high - orb_low : na
+
+// ATR filter check
+atr_ok = true
+if i_use_atr and orb_set and not na(daily_atr) and daily_atr > 0
+    atr_ok := orb_range >= daily_atr * i_atr_min_mult and orb_range <= daily_atr * i_atr_max_mult
+
+// VWAP bias check
+vwap_long_ok  = i_use_vwap ? (not na(vwap_value) and vwap_value >= orb_high) : true
+vwap_short_ok = i_use_vwap ? (not na(vwap_value) and vwap_value <= orb_low) : true
+
+// ── LONG breakout: candle closes above ORB high ────────────────────────────
+long_breakout = orb_set and is_trade_window and is_strong and trades_today < i_max_trades and atr_ok and pm_valid and close > orb_high and open <= orb_high and vwap_long_ok
+
+// ── SHORT breakout: candle closes below ORB low ────────────────────────────
+short_breakout = orb_set and is_trade_window and is_strong and trades_today < i_max_trades and atr_ok and pm_valid and close < orb_low and open >= orb_low and vwap_short_ok
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TRADE EXECUTION
+// ══════════════════════════════════════════════════════════════════════════════
+
+if long_breakout and strategy.position_size == 0
+    entry = close
+    stop  = orb_low - i_stop_buffer
+    risk  = entry - stop
+    target = entry + risk * i_rr_ratio
+
+    strategy.entry("ORB Long", strategy.long)
+    strategy.exit("Long TP/SL", "ORB Long", stop=stop, limit=target)
+    trades_today += 1
+
+    label.new(bar_index, low, "LONG", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+if short_breakout and strategy.position_size == 0
+    entry  = close
+    stop   = orb_high + i_stop_buffer
+    risk   = stop - entry
+    target = entry - risk * i_rr_ratio
+
+    strategy.entry("ORB Short", strategy.short)
+    strategy.exit("Short TP/SL", "ORB Short", stop=stop, limit=target)
+    trades_today += 1
+
+    label.new(bar_index, high, "SHORT", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+// ── End-of-day flat close ──────────────────────────────────────────────────
+if is_eod_close and strategy.position_size != 0
+    strategy.close_all("EOD Close")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PLOTTING
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ORB levels
+plot(i_show_orb and orb_set and is_after_orb ? orb_high : na, "ORB High", color=i_orb_color_hi, style=plot.style_linebr, linewidth=2)
+plot(i_show_orb and orb_set and is_after_orb ? orb_low : na, "ORB Low", color=i_orb_color_lo, style=plot.style_linebr, linewidth=2)
+
+// VWAP
+plot(i_show_vwap and is_regular_session ? vwap_value : na, "VWAP", color=color.new(color.orange, 20), style=plot.style_linebr, linewidth=1)
+
+// Background highlight for ORB candle
+bgcolor(is_orb_candle ? color.new(color.yellow, 85) : na, title="ORB Candle Highlight")
+
+// ── Info table ──────────────────────────────────────────────────────────────
+var table info = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast and orb_set
+    table.cell(info, 0, 0, "ORB High",       text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 0, str.tostring(orb_high, format.mintick), text_color=color.green, text_size=size.small)
+    table.cell(info, 0, 1, "ORB Low",        text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 1, str.tostring(orb_low, format.mintick), text_color=color.red, text_size=size.small)
+    table.cell(info, 0, 2, "ORB Range",      text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 2, str.tostring(orb_range, format.mintick), text_color=color.yellow, text_size=size.small)
+    table.cell(info, 0, 3, "VWAP",           text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 3, str.tostring(vwap_value, format.mintick), text_color=color.orange, text_size=size.small)
+    table.cell(info, 0, 4, "Daily ATR",      text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 4, str.tostring(daily_atr, format.mintick), text_color=color.aqua, text_size=size.small)
+    table.cell(info, 0, 5, "Trades Today",   text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 5, str.tostring(trades_today) + " / " + str.tostring(i_max_trades), text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 6, "PM Valid",       text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 6, pm_valid ? "✓" : "✗", text_color=pm_valid ? color.green : color.red, text_size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(long_breakout,  "ORB Long Breakout",  "ORB LONG: Price broke above ORB High with strong candle confirmation")
+alertcondition(short_breakout, "ORB Short Breakout", "ORB SHORT: Price broke below ORB Low with strong candle confirmation")
