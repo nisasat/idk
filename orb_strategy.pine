@@ -2,7 +2,7 @@
 // https://mozilla.org/MPL/2.0/
 
 //@version=5
-strategy("ORB Futures Trading Bot", overlay=true, default_qty_type=strategy.contracts, default_qty_value=1, calc_on_every_tick=false)
+strategy("ORB Futures Trading Bot", overlay=true, default_qty_value=1, calc_on_every_tick=false)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // INPUTS
